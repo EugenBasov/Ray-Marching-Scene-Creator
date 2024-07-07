@@ -1,0 +1,611 @@
+#pragma kernel CSMain
+
+//#include "D:\Programs\Unity\2022.3.11f1\Editor\Data\CGIncludes\Lighting.cginc"
+//#include "D:\Programs\Unity\2022.3.11f1\Editor\Data\CGIncludes\AutoLight.cginc"
+#include "UnityCG.cginc"
+#include "RayMarchingH.cginc"
+#include "RayMarchingSDFs.cginc"
+//int bccd;
+#define LIGHT_DIRECTIONAL 1
+#define LIGHT_POINT 2
+#define LIGHT_SPOT 0
+
+struct RayMarchingLight
+{
+    int type;
+    float3 position;
+    float3 direction;
+    float range;
+    float spotAngle;
+    float4 color;
+    float intensity;
+};
+
+RWStructuredBuffer<RayMarchingLight> Lights;
+
+float calcObjectDist(float3 p, int objIdx)
+{
+    objIdx = abs(objIdx);
+    p -= Objects[objIdx].position;
+    p = rotate(p, Objects[objIdx].repetitionRotation);
+    float3 id = round(p / (Objects[objIdx].repetitionOffset * Objects[objIdx].scale * 2));
+    float3 dirSgn = sign(p - Objects[objIdx].repetitionOffset * Objects[objIdx].scale * 2 * id);
+    //id += dirSgn * ((p - Objects[objIdx].repetitionOffset * Objects[objIdx].scale * 2 * id) <= 0.001);
+    //dirSgn = sign(p - Objects[objIdx].repetitionOffset * Objects[objIdx].scale * 2 * id);
+    float3 transformP;
+    //p -= Objects[objIdx].repetitionOffset * round(p / Objects[objIdx].repetitionOffset);
+    float res = MAX_DIST;
+    int3 rid;
+    for (int i1 = 0; i1 < Objects[objIdx].fixArtifacts + 1; i1++)
+    {
+        for (int i2 = 0; i2 < Objects[objIdx].fixArtifacts + 1; i2++)
+        {
+            for (int i3 = 0; i3 < Objects[objIdx].fixArtifacts + 1; i3++)
+            {
+                rid = id + dirSgn * int3(i1, i2, i3);
+                rid = clamp(rid, 0, Objects[objIdx].repetitionCount - 1);
+                if (all(rid == clamp(rid, min(Objects[objIdx].repetitionCarve1, Objects[objIdx].repetitionCarve2) - 1,
+                                          max(Objects[objIdx].repetitionCarve1, Objects[objIdx].repetitionCarve2) - 1)))
+                {
+                    rid = min(Objects[objIdx].repetitionCarve1, Objects[objIdx].repetitionCarve2)-1-1;
+
+                }
+                transformP = p - Objects[objIdx].repetitionOffset * Objects[objIdx].scale * 2 * rid;
+                transformP = rotate(transformP, Objects[objIdx].rotation);
+                switch (Objects[objIdx].type)
+                {
+                    case SPHERE:
+                        res = min(res, sphere(transformP, Objects[objIdx].scale));
+                        break;
+                    case CUBE:
+                    //transformP.x -= 6.0 * round(transformP.x / 6.0);
+                        res = min(res, boxFrame(transformP, Objects[objIdx].scale, Objects[objIdx].otherParams[0], Objects[objIdx].otherParams[1]));
+                        break;
+                    case TORUS:
+                        break;
+                    case CAPSULE_VERTICAL:
+                        res = min(res, capsuleVertical(transformP, Objects[objIdx].otherParams[1], Objects[objIdx].otherParams[0]));
+                        break;
+                    case CONE_ROUND_VERTICAL:
+                        res = min(res, coneRoundVertical(transformP, Objects[objIdx].otherParams[0], Objects[objIdx].otherParams[1], Objects[objIdx].otherParams[2]));
+                        break;
+                    case CONE_CAPPED_VERTICAL:
+                        res = min(res, coneCappedVertical(transformP, Objects[objIdx].otherParams[0], Objects[objIdx].otherParams[1], Objects[objIdx].otherParams[2]));
+                        break;
+                    case CYLINDER_VERTICAL:
+                        res = min(res, cylinderVertical(transformP, Objects[objIdx].otherParams[0], Objects[objIdx].otherParams[1]));
+                        break;
+                    case CYLINDER_ROUND:
+                        res = min(res, cylinderRounded(transformP, Objects[objIdx].otherParams[0], Objects[objIdx].otherParams[1], Objects[objIdx].otherParams[2]));
+                        break;
+                    case PLANE:
+                        res = min(res, plane(transformP));
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+    
+    return res;
+}
+
+float getCoef(float funcIdx)
+{
+    return (abs(funcIdx) - (int) abs(funcIdx)) * 10.0;
+
+}
+
+float applyFunc(float d1, float d2, float funcIdx)
+{
+    switch ((int) funcIdx)
+    {
+        case 1:
+            return min(d1, d2);
+        case 2:
+            return max(d1, d2);
+        case 3:
+            return smin(d1, d2, (funcIdx - (int) funcIdx) * 10);
+        case 4:
+            return smax(d1, d2, (funcIdx - (int) funcIdx) * 10);
+        default:
+            return MAX_DIST;
+    }
+}
+
+MaterialMix mixMaterials(MaterialMix m1, MaterialMix m2, int m1_idx, int m2_idx, float funcIdx)
+{
+    float k;
+    switch (abs((int)funcIdx))
+    {
+        case 1:
+            k = objProcQueue[threadId][m1_idx] >= objProcQueue[threadId][m2_idx] ? 0 : 1;
+            break;
+        case 2:
+            k = objProcQueue[threadId][m1_idx] < objProcQueue[threadId][m2_idx] ? 0 : 1;
+            break;
+        case 3:
+            k = pow(max(getCoef(funcIdx) * 3.414 - abs(objProcQueue[threadId][m1_idx] - objProcQueue[threadId][m2_idx]), 0.0) / (getCoef(funcIdx) * 3.414), 2.0) * 0.5;
+            if (objProcQueue[threadId][m1_idx] < objProcQueue[threadId][m2_idx])
+                k = 1 - k;
+            break;
+        case 4:
+            k = pow(max(getCoef(funcIdx) * 3.414 - abs(objProcQueue[threadId][m1_idx] - objProcQueue[threadId][m2_idx]), 0.0) / (getCoef(funcIdx) * 3.414), 2.0) * 0.5;
+            if (objProcQueue[threadId][m1_idx] >= objProcQueue[threadId][m2_idx])
+                k = 1 - k;
+            break;
+    }
+    return materialMix(m1, m2, k);
+
+}
+
+float getMixFactor(int obj1, int obj2, float funcIdx)
+{
+    float k;
+    switch (abs((int) funcIdx))
+    {
+        case 1:
+            k = objProcQueue[threadId][obj1] <= objProcQueue[threadId][obj2] ? 0 : 1;
+            break;
+        case 2:
+            k = objProcQueue[threadId][obj1] > objProcQueue[threadId][obj2] ? 0 : 1;
+            break;
+        case 3:
+            k = pow(max(getCoef(funcIdx) * 3.414 - abs(objProcQueue[threadId][obj1] - objProcQueue[threadId][obj2]), 0.0) / (getCoef(funcIdx) * 3.414), 2.0) * 0.5;
+            if (objProcQueue[threadId][obj1] >= objProcQueue[threadId][obj2])
+                k = 1 - k;
+            break;
+        case 4:
+            k = pow(max(getCoef(funcIdx) * 3.414 - abs(objProcQueue[threadId][obj1] - objProcQueue[threadId][obj2]), 0.0) / (getCoef(funcIdx) * 3.414), 2.0) * 0.5;
+            if (objProcQueue[threadId][obj1] < objProcQueue[threadId][obj2])
+                k = 1 - k;
+            break;
+    }
+    
+    return k;
+}
+
+float3 getTexColor(int obj, float3 n, float3 p)
+{
+    n = rotate(n, Objects[obj].rotation);
+    n = abs(oneNormNormalize(pow(n, 10)));
+    //n = abs(normalize(infNormNormalize(n)));
+    float3 texUV = rotate(p - Objects[obj].position, Objects[obj].rotation);
+    if (!Materials[obj].texFixed)
+        texUV = ((texUV % (Objects[obj].scale * Materials[obj].texStretch)) / (2.0 * Objects[obj].scale * Materials[obj].texStretch) + 0.5);
+    else
+        texUV = ((texUV % Materials[obj].texStretch) / (2.0 * Materials[obj].texStretch) + 0.5);
+    texUV *= TEXTURE_SIZE;
+    float3 texXY = textures[float3(texUV.xy, obj)].xyz;
+    float3 texXZ = textures[float3(texUV.xz, obj)].xyz;
+    float3 texYZ = textures[float3(texUV.yz, obj)].xyz;
+    
+    //return n;
+    return float3(n.z * texXY + n.y * texXZ + n.x * texYZ);
+}
+
+MaterialMix materialTomaterialMix(int obj, float3 n, float3 p)
+{
+    obj = abs(obj);
+    MaterialMix m_out;
+    m_out.color = Materials[obj].color;
+    m_out.roughness = Materials[obj].roughness;
+    m_out.specular = Materials[obj].specular;
+    m_out.specularColor = Materials[obj].specularColor;
+    m_out.texColor = getTexColor(obj, n, p);
+    
+    return m_out;
+
+}
+
+float getDist(float3 p)
+{
+
+    int queuePivot = 0;
+    int lastProcessedI = 1;
+    int currGroupSize = 0;
+    int treeDeep = 0;
+    int prevChildNode = 0;
+    
+    // Find leafe
+    for (; lastProcessedI < groupsTreeSize; lastProcessedI++, treeDeep++)
+    {
+        if (lastProcessedI == groupsTree[lastProcessedI].x)
+            break;
+
+    }
+    
+    for (int i = lastProcessedI; i != 0;) //start in leafe
+    {
+        if (i != groupsTree[i].x)
+        {
+            if (prevChildNode > i + 1)
+            {
+                objProcQueue[threadId][queuePivot - 2] = applyFunc(objProcQueue[threadId][queuePivot - 2], objProcQueue[threadId][queuePivot - 1], abs(groupsTree[i].w));
+                queuePivot--;
+
+            }
+            if (groupsTree[i].x > lastProcessedI)
+            {
+                i = 1 + lastProcessedI + treeDeep;
+                treeDeep++;
+
+            }
+            else
+            {
+                if (groupsTree[i].w < 0)
+                {
+                    objProcQueue[threadId][queuePivot - 1] *= -1;
+                }
+                prevChildNode = i;
+                i = groupsTree[i].z;
+            }
+            
+        }
+        else
+        {
+            objProcQueue[threadId][queuePivot] = calcObjectDist(p, groupsTree[i].w);
+            if (groupsTree[i].w < 0)
+            {
+                objProcQueue[threadId][queuePivot] *= -1.0;
+            }
+            queuePivot++;
+            lastProcessedI = i;
+            treeDeep = 0;
+            prevChildNode = i;
+            i = groupsTree[i].z;
+
+        }
+
+    }
+
+    return objProcQueue[threadId][0];
+
+}
+
+float3 getNormal(float3 p)
+{
+    float d = getDist(p);
+    float2 e = float2(0.001, 0);
+    float3 n = d - float3(getDist(p - e.xyy), getDist(p - e.yxy), getDist(p - e.yyx));
+    return normalize(n);
+}
+
+float ambientOcclusion(float3 p, float3 n)
+{
+    float step = _AmbientOcclusionStep;
+    float k = _AmbientOcclusionIntensity;
+    float iter = _AmbientOcclusionIterations;
+    float ao = 0.0;
+    float dist;
+    //p += n * step;
+    for (int i = 1; i < iter; i++)
+    {
+        dist = step * i;
+        ao += max(0.0, (dist - getDist(p + n * dist)) / dist);
+
+    }
+    return (1 - ao * k);
+
+}
+
+float softShadow(float3 p, float3 dir)
+{
+    float res = 1.0;
+    float mint = _ShadowsMinDistance;
+    float maxt = _ShadowsMaxDistance;
+    float k = _ShadowsSoftness;
+    float mins = _ShadowsMinStep;
+    float maxs = _ShadowsMaxStep;
+    float iter = _ShadowsIterations;
+    
+    for (int i = 0; i < iter && mint < maxt; i++)
+    {
+        float h = getDist(p + mint * dir);
+        res = min(res, h / (k * mint));
+        mint += clamp(h, mins, maxs);
+        if (res < -1.0 || mint > maxt)
+            break;
+
+    }
+    res = max(res, -1.0);
+    return 0.25 * (1.0 + res) * (1.0 + res) * (2.0 - res);
+}
+
+inline float normalShadow(float3 norm, float3 lDir)
+{
+    return clamp(dot(norm, lDir) * 0.5 + 0.5, 0, 1);
+}
+
+float attenuation(float lightDist, int i, float3 lDir = 0.0)
+{
+    if (all(lDir == 0.0))
+    {
+        return min(3.0 / (1.0 + ((lightDist) / (Lights[i].range)) + ((lightDist * lightDist) / (Lights[i].range * Lights[i].range))), 1.0);
+    }
+    else
+    {
+        return (1.0 / (1.0 + 25.0 * pow(lightDist / Lights[i].range, 2.0)))/* * saturate((1.0 - lightDist / Lights[i].range) * 5.0) */*
+        (clamp((dot(lDir, -normalize(Lights[i].direction)) - cos(Lights[i].spotAngle / 2.0)) / -(cos(Lights[i].spotAngle / 2.0) - cos(clamp((Lights[i].spotAngle / 2.0) * 1.1, 0.0, Pi / 2.0))), 0.0, 1.0));
+    }
+}
+
+float3 specular(float3 viewDir, float3 lightDir, float3 norm, float rough, float k, float3 col)
+{
+    float exp = rough;
+    exp = max(exp, 0.001);
+    exp = 1 / exp;
+    float3 hDir = normalize(lightDir + viewDir);
+    return pow(saturate(dot(hDir, norm)), exp) * max((k - rough) * (1 - rough), 0.0) * col;
+
+}
+
+MaterialMix getMaterial(float3 p, float3 n)
+{
+    int queuePivot = 0;
+    int coefsPivot = 0;
+    int lastProcessedI = 1;
+    int treeDeep = 0;
+    int prevChildNode = 0;
+    float k = 0;
+    int refI = 0;
+    int j;
+    
+    // Find leafe
+    for (; lastProcessedI < groupsTreeSize; lastProcessedI++, treeDeep++)
+    {
+        if (lastProcessedI == groupsTree[lastProcessedI].x)
+            break;
+
+    }
+    
+    for (int i = lastProcessedI; i != 0;) //start in leafe
+    {
+        if (i != groupsTree[i].x)
+        {
+            if (prevChildNode > i + 1)
+            {
+                k = getMixFactor(queuePivot - 2, queuePivot - 1, abs(groupsTree[i].w));
+                refI = int(objMaterialCoefs[threadId][coefsPivot - 1] / 10.0);
+                for (j = coefsPivot - 1; ((j >= 0) && (int(objMaterialCoefs[threadId][j] / 10.0) == refI)); j--)
+                {
+                    objMaterialCoefs[threadId][j] = 10 * i + (objMaterialCoefs[threadId][j] % 10) * k;
+
+                }
+                for (; ((j >= 0) && (int(objMaterialCoefs[threadId][j] / 10) >= i)); j--)
+                {
+                    objMaterialCoefs[threadId][j] = 10 * i + (objMaterialCoefs[threadId][j] % 10) * (1 - k);
+
+                }
+                
+                objProcQueue[threadId][queuePivot - 2] = applyFunc(objProcQueue[threadId][queuePivot - 2], objProcQueue[threadId][queuePivot - 1], abs(groupsTree[i].w));
+                queuePivot--;
+
+            }
+            
+            
+            if (groupsTree[i].x > lastProcessedI)
+            {
+                i = 1 + lastProcessedI + treeDeep;
+                treeDeep++;
+
+            }
+            else
+            {
+                
+                if (groupsTree[i].w < 0)
+                {
+                    objProcQueue[threadId][queuePivot - 1] *= -1;
+                }
+                prevChildNode = i;
+                i = groupsTree[i].z;
+            }
+            
+        }
+        else
+        {
+            objProcQueue[threadId][queuePivot] = calcObjectDist(p, groupsTree[i].w);
+            objMaterialCoefs[threadId][coefsPivot] = 1.0;
+            if (i == groupsTree[i].z + 1)
+                objMaterialCoefs[threadId][coefsPivot] += (groupsTree[i].z * 10.0);
+            if (groupsTree[i].w < 0)
+            {
+                objProcQueue[threadId][queuePivot] *= -1.0;
+            }
+            queuePivot++;
+            coefsPivot++;
+            lastProcessedI = i;
+            treeDeep = 0;
+            prevChildNode = i;
+            i = groupsTree[i].z;
+
+        }
+
+    }
+    
+    MaterialMix new_m;
+
+    for (j = 0; j < coefsPivot; j++)
+    {
+        new_m.color += Materials[j].color * (objMaterialCoefs[threadId][j] % 10.0);
+        new_m.roughness += Materials[j].roughness * (objMaterialCoefs[threadId][j] % 10.0);
+        new_m.specular += Materials[j].specular * (objMaterialCoefs[threadId][j] % 10.0);
+        new_m.specularColor += Materials[j].specularColor * (objMaterialCoefs[threadId][j] % 10.0);
+        new_m.texColor += getTexColor(j, n, p) * (objMaterialCoefs[threadId][j] % 10.0);
+    }
+
+    return new_m;
+
+}
+
+
+
+float4 getLight(float3 p, float3 ro, int i, float3 lightPos)
+{
+    float3 lDir;
+    float intencivity;
+    float3 viewDir = normalize(p - ro);
+    float3 n = getNormal(p);
+    float4 finColor = float4(0.0, 0.0, 0.0, 1.0);
+    MaterialMix mat = getMaterial(p, n);
+    for (int i = 0; i < nrOfLights; i++)
+    {
+        switch (Lights[i].type)
+        {
+            case LIGHT_DIRECTIONAL:
+                lDir = normalize(-Lights[i].direction);
+                finColor += float4(
+                            (mat.texColor * mat.color + specular(-viewDir, lDir, n, mat.roughness, mat.specular, mat.specularColor)) *
+                            Lights[i].color.rgb * 
+                            Lights[i].intensity * 
+                           (softShadow(p + n * 0.002, lDir) * 0.5 + 0.5) * 
+                            normalShadow(n,lDir) *
+                            ambientOcclusion(p, n),
+                            0);
+                break;
+            case LIGHT_POINT:
+                intencivity = attenuation(length(Lights[i].position - p), i);
+                if (intencivity != 0.0)
+                {
+                    lDir = normalize(Lights[i].position - p);
+                    finColor += float4(
+                            (mat.texColor * mat.color + specular(-viewDir, lDir, n, mat.roughness, mat.specular, mat.specularColor)) *
+                            Lights[i].color.rgb *
+                            Lights[i].intensity *
+                           (softShadow(p + n * 0.002, lDir) * 0.5 + 0.5) *
+                            normalShadow(n, lDir) *
+                            ambientOcclusion(p, n) *
+                            intencivity,
+                            0);
+                }
+                break;
+            case LIGHT_SPOT:
+                lDir = normalize(Lights[i].position - p);
+                intencivity = attenuation(length(Lights[i].position - p), i, lDir);
+                if (intencivity != 0.0)
+                {
+                    finColor += float4(
+                            (mat.texColor * mat.color + specular(-viewDir, lDir, n, mat.roughness, mat.specular, mat.specularColor)) *
+                            Lights[i].color.rgb *
+                            Lights[i].intensity *
+                           (softShadow(p + n * 0.002, lDir) * 0.5 + 0.5) *
+                            normalShadow(n, lDir) *
+                            ambientOcclusion(p, n) *
+                            intencivity,
+                            0);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    
+    //float3 l = normalize(lightPos - p);
+    //float3 n = getNormal(p);
+    //float dif = clamp(dot(n, l) * 0.5 + 0.5, 0, 1);
+                //float d = raymarchLight(p + n * 0.1 * 10, l);
+                //d += 1;
+                //d = clamp(d, 0, 1);
+                //dif *= d;
+                //float4 col = float4(dif * color, 1);
+
+                //float occ = (float(i) / ITERATIONS * 2);
+                //occ = 1 - occ;
+                //occ *= occ;
+                //col.rgb *= occ;
+                
+                //float fog = distance(p, ro);
+                //fog /= (MAX_DIST / 5);
+                //fog = clamp(fog, 0, 1);
+                //fog *= fog;
+                //col.rgb = col.rgb * (1 - fog) + 0.5 * fog;
+    return finColor;
+}
+
+float4 raymarch(float3 ro, float3 rd, float depth)
+{
+    float3 p = ro;
+    int i;
+    for (i = 0; i < ITERATIONS; i++)
+    {
+        //rayInfo r = getDist(p);
+        float d = getDist(p);
+        //float3 col = r.color;
+        p += rd * d;
+        if (length(p - ro) >= depth || length(p - ro) > MAX_DIST)
+        {
+            return 0;
+        }
+        //if (d < length(p - ro)  / (TETRAHEDRON_ITERATIONS * 40))
+        //{
+                        //col += pow(col, 2) * (i / ((length(p - ro) * 20.0)));
+        //    return getLight(p, ro, i, float3(0, 50, 0), col);
+                        //break;
+        //}
+        if (length(p - ro) / d >= 1000.0)
+        {
+           //return float4((5.0 / length(p - ro)).xxx, 1.0);
+           return getLight(p, ro, i, float3(0, 50, 0));
+        }
+    }
+    return float4(0, 0, 0, 0);
+                //return getLight(p, ro, i, float3(0, 50, 0), float3(0, 0, 0));
+}
+
+
+/*float LinearEyeDepth0(float rawdepth)
+{
+    float _NearClip = 0.1;
+    float _FarClip = 1000.0;
+    float x, y, z, w;
+#if SHADER_API_GLES3 // insted of UNITY_REVERSED_Z
+    x = -1.0 + _NearClip/ _FarClip;
+    y = 1;
+    z = x / _NearClip;
+    w = 1 / _NearClip;
+#else
+    x = 1.0 - _NearClip / _FarClip;
+    y = _NearClip / _FarClip;
+    z = x / _NearClip;
+    w = y / _NearClip;
+#endif
+ 
+    return 1.0 / (z * rawdepth + w);
+}*/
+SamplerState MyLinearClampSampler;
+[numthreads(THREADX, THREADY, THREADZ)]
+void CSMain(uint3 id : SV_DispatchThreadID, uint threadIndex : SV_GroupIndex)
+{
+    threadId = threadIndex;
+    float2 uv = id.xy / Resolution;
+    #if UNITY_UV_STARTS_AT_TOP
+       uv.y = 1.0 - uv.y;
+    #endif
+    //float3 rdCam = viewSpace.xyz; // / viewSpace.w;
+    float3 rayX1 = lerp(_FrustumCornersES[0], _FrustumCornersES[3], uv.x).xyz;
+    float3 rayX2 = lerp(_FrustumCornersES[1], _FrustumCornersES[2], uv.x).xyz;
+    float3 ray = lerp(rayX1, rayX2, uv.y);
+    //ray = float3(id.xy / float2(1920, 1080), 1) - float3(0.5, 0.5, 0);
+    
+      //float depth = LinearEyeDepth(tex2D(_CameraDepthTexture, id.xy).r);
+    float depth = LinearEyeDepth(DepthData[id.xy]);
+    //Linear
+    //depth *= 300.0;
+    depth /= dot(normalize(ray.xyz), normalize(_CameraFoward));
+
+    float3 rd = normalize(ray.xyz);
+    float3 ro = _CameraWS;
+
+    float4 c = raymarch(ro, rd, depth);
+    c = c * c.a + ScreenData[id.xy] * (1 - c.a);
+    float4 col = float4(c.r, c.g, c.b, 1);
+
+    //Result[id.xy] = float4(1.0,0.0,0.0,1.0);
+    //float4 colort = textures[float3(uv * TEXTURE_SIZE, 0.0)];
+    //colort = texelFetch();
+    Result[id.xy] = col;
+    //Result[id.xy] = float4(pow(DepthData[id.xy], 20).xyz, 1.0);
+    //Result[id.xy] = textures.Sample(MeshTextureSampler, float2(1,1));
+
+}
