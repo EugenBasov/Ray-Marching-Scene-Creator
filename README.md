@@ -13,6 +13,11 @@ Features list
 - Objects repetition
 - Blinn-Phong lightning and materials support
 
+Preview
+-----------
+<img src="Preview/CameraScreenshot.png"/>
+This entire scene was created and rendered with Ray Marching Scene Creator.
+
 Install
 -------
 
